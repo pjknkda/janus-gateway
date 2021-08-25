@@ -163,6 +163,9 @@ static int restamp_min_th = DEFAULT_RESTAMP_MIN_TH;
 #define DEFAULT_RESTAMP_PACKETS 10
 static int restamp_packets = DEFAULT_RESTAMP_PACKETS;
 
+#define DEFAULT_SKIP_BROKEN_HEADER 0
+static int skip_broken_header = DEFAULT_SKIP_BROKEN_HEADER;
+
 /* Signal handler */
 static void janus_pp_handle_signal(int signum) {
 	working = 0;
@@ -327,6 +330,11 @@ int main(int argc, char *argv[])
 		if(val >= 0)
 			restamp_min_th = val;
 	}
+	if(args_info.skip_broken_header_given || (g_getenv("JANUS_PPREC_SKIP_BROKEN_HEADER") != NULL)) {
+		int val = args_info.skip_broken_header_given ? args_info.skip_broken_header_arg : atoi(g_getenv("JANUS_PPREC_SKIP_BROKEN_HEADER"));
+		if(val >= 0)
+			skip_broken_header = val;
+	}
 	/* Evaluate arguments to find source and target */
 	char *source = NULL, *destination = NULL, *setting = NULL;
 	int i=0;
@@ -351,7 +359,8 @@ int main(int argc, char *argv[])
 				(strcmp(setting, "-C")) && (strcmp(setting, "--silence-distance")) &&
 				(strcmp(setting, "-r")) && (strcmp(setting, "--restamp")) &&
 				(strcmp(setting, "-c")) && (strcmp(setting, "--restamp-packets")) &&
-				(strcmp(setting, "-n")) && (strcmp(setting, "--restamp-min-th"))
+				(strcmp(setting, "-n")) && (strcmp(setting, "--restamp-min-th")) &&
+				(strcmp(setting, "-b")) && (strcmp(setting, "--skip-broken-header"))
 		)) {
 			if(source == NULL)
 				source = argv[i];
@@ -383,6 +392,8 @@ int main(int argc, char *argv[])
 			JANUS_LOG(LOG_INFO, "Video orientation extension ID: %d\n", video_orient_extmap_id);
 		if(silence_distance > 0)
 			JANUS_LOG(LOG_INFO, "RTP silence suppression distance: %d\n", silence_distance);
+		if(skip_broken_header > 0)
+			JANUS_LOG(LOG_INFO, "Allowed forwading bytes to skip broken frame header: %d\n", skip_broken_header);
 		JANUS_LOG(LOG_INFO, "\n");
 		if(source != NULL)
 			JANUS_LOG(LOG_INFO, "Source file: %s\n", source);
@@ -440,6 +451,7 @@ int main(int argc, char *argv[])
 	gboolean e2ee = FALSE;
 	gint64 c_time = 0, w_time = 0;
 	int bytes = 0, skip = 0;
+	int offset_to_next_header = 0, next_header_found = 0;
 	long offset = 0;
 	uint16_t len = 0;
 	uint32_t count = 0;
@@ -460,9 +472,34 @@ int main(int argc, char *argv[])
 		fseek(file, offset, SEEK_SET);
 		bytes = fread(prebuffer, sizeof(char), 8, file);
 		if(bytes != 8 || prebuffer[0] != 'M') {
-			JANUS_LOG(LOG_WARN, "Invalid header at offset %ld (%s), the processing will stop here...\n",
-				offset, bytes != 8 ? "not enough bytes" : "wrong prefix");
-			break;
+			/* find the next valid header */
+			next_header_found = 0;
+			offset_to_next_header = 0;
+			while(working && offset + offset_to_next_header < fsize && offset_to_next_header < skip_broken_header) {
+                offset_to_next_header += 1;
+				fseek(file, offset + offset_to_next_header, SEEK_SET);
+				bytes = fread(prebuffer, sizeof(char), 8, file);
+				if (bytes < 8) {
+					break;
+				}
+				if (prebuffer[0] == 'M' && (prebuffer[1] == 'E' || prebuffer[1] == 'J')) {
+					next_header_found = 1;
+					break;
+				}
+			}
+
+			if (!working)
+				break;
+
+			if (next_header_found == 0) {
+				JANUS_LOG(LOG_ERR, "Invalid header at offset %ld (%s), the processing will stop here...\n",
+					offset, bytes != 8 ? "not enough bytes" : "wrong prefix");
+				break;
+			} else {
+				JANUS_LOG(LOG_WARN, "Invalid header at offset %ld (wrong prefix), but the next valid header is found after skipping %d bytes\n",
+					offset, offset_to_next_header);
+				offset += offset_to_next_header;
+			}
 		}
 		if(prebuffer[1] == 'E') {
 			/* Either the old .mjr format header ('MEETECHO' header followed by 'audio' or 'video'), or a frame */
@@ -815,8 +852,34 @@ int main(int argc, char *argv[])
 		fseek(file, offset, SEEK_SET);
 		bytes = fread(prebuffer, sizeof(char), 8, file);
 		if(bytes != 8 || prebuffer[0] != 'M') {
-			/* Broken packet? Stop here */
-			break;
+			/* Broken packet? */
+			next_header_found = 0;
+			offset_to_next_header = 0;
+			while(working && offset + offset_to_next_header < fsize && offset_to_next_header < skip_broken_header) {
+				offset_to_next_header += 1;
+				fseek(file, offset + offset_to_next_header, SEEK_SET);
+				bytes = fread(prebuffer, sizeof(char), 8, file);
+				if (bytes < 8) {
+					break;
+				}
+				if (prebuffer[0] == 'M' && (prebuffer[1] == 'E' || prebuffer[1] == 'J')) {
+					next_header_found = 1;
+					break;
+				}
+			}
+
+			if (!working)
+				break;
+
+			if (next_header_found == 0) {
+				JANUS_LOG(LOG_ERR, "Invalid header at offset %ld (%s), the processing will stop here...\n",
+					offset, bytes != 8 ? "not enough bytes" : "wrong prefix");
+				break;
+			} else {
+				JANUS_LOG(LOG_WARN, "Invalid header at offset %ld (wrong prefix), but the next valid header is found after skipping %d bytes\n",
+					offset, offset_to_next_header);
+				offset += offset_to_next_header;
+			}
 		}
 		if(has_timestamps) {
 			/* Read the packet timestamp */
